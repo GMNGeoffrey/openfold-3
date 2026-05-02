@@ -37,6 +37,7 @@ from openfold3.core.utils.checkpointing import checkpoint_blocks, checkpoint_sec
 from openfold3.core.utils.chunk_utils import (
     CUEQ_MAX_CHUNK_SIZE,
     DEFAULT_MAX_CHUNK_SIZE,
+    TRITON_MAX_CHUNK_SIZE,
     ChunkSizeTuner,
 )
 from openfold3.core.utils.tensor_utils import add
@@ -387,11 +388,11 @@ class TemplatePairStack(nn.Module):
 
         if chunk_size is not None and self.chunk_size_tuner is not None:
             assert not self.training
-            max_chunk_size = (
-                CUEQ_MAX_CHUNK_SIZE
-                if use_cueq_triangle_kernels
-                else DEFAULT_MAX_CHUNK_SIZE
-            )
+            max_chunk_size = DEFAULT_MAX_CHUNK_SIZE
+            if use_cueq_triangle_kernels:
+                max_chunk_size = CUEQ_MAX_CHUNK_SIZE
+            if use_triton_triangle_kernels:
+                max_chunk_size = TRITON_MAX_CHUNK_SIZE
             tuned_chunk_size = self.chunk_size_tuner.tune_chunk_size(
                 representative_fn=blocks[0],
                 args=(t.clone(),),
@@ -400,7 +401,7 @@ class TemplatePairStack(nn.Module):
             )
             attn_chunk = (
                 tuned_chunk_size
-                if use_cueq_triangle_kernels
+                if use_cueq_triangle_kernels or use_triton_triangle_kernels
                 else (tuned_chunk_size // 4)
             )
             blocks = [

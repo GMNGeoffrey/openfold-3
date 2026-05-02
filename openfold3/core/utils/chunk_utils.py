@@ -27,6 +27,7 @@ from openfold3.core.utils.tensor_utils import (
 
 DEFAULT_MAX_CHUNK_SIZE = 512
 CUEQ_MAX_CHUNK_SIZE = 1024
+TRITON_MAX_CHUNK_SIZE = 1024
 
 
 def _fetch_dims(tree):
