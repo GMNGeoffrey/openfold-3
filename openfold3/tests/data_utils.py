@@ -12,52 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from random import randint
-
 import numpy as np
 import torch
 from biotite.structure import Atom, AtomArray, BondList, array
 from scipy.spatial.transform import Rotation
 
-from openfold3.core.data.primitives.featurization.structure import (
-    create_atom_to_token_index,
-)
-from openfold3.core.data.resources.residues import (
-    STANDARD_DNA_RESIDUES,
-    STANDARD_PROTEIN_RESIDUES_3,
-    STANDARD_RESIDUES_3,
-    STANDARD_RESIDUES_WITH_GAP_3,
-    STANDARD_RNA_RESIDUES,
-)
-from openfold3.core.data.resources.token_atom_constants import (
-    TOKEN_NAME_TO_ATOM_NAMES,
-)
-from openfold3.core.utils.atomize_utils import broadcast_token_feat_to_atoms
+from openfold3.core.data import synthetic
 from openfold3.tests.config import consts
 
 
 def random_asym_ids(n_res, split_chains=True, min_chain_len=4):
-    n_chain = randint(1, n_res // min_chain_len) if consts.is_multimer else 1
-
-    if not split_chains:
-        return [0] * n_res
-
-    assert n_res >= n_chain
-
-    pieces = []
-    asym_ids = []
-    final_idx = n_chain - 1
-    for idx in range(n_chain - 1):
-        n_stop = n_res - sum(pieces) - n_chain + idx - min_chain_len
-        if n_stop <= min_chain_len:
-            final_idx = idx
-            break
-        piece = randint(min_chain_len, n_stop)
-        pieces.append(piece)
-        asym_ids.extend(piece * [idx])
-    asym_ids.extend((n_res - sum(pieces)) * [final_idx])
-
-    return np.array(asym_ids).astype(np.float32) + 1
+    """Test wrapper around :func:`openfold3.core.data.synthetic.random_asym_ids`
+    that sources ``is_multimer`` from the test ``consts`` so existing tests keep
+    their monomer/multimer behavior."""
+    return synthetic.random_asym_ids(
+        n_res,
+        is_multimer=consts.is_multimer,
+        split_chains=split_chains,
+        min_chain_len=min_chain_len,
+    )
 
 
 def random_template_feats(n_templ, n, batch_size=None):
@@ -161,137 +134,17 @@ def random_attention_inputs(
 
 
 def random_of3_features(batch_size, n_token, n_msa, n_templ, is_eval=False):
-    restypes_flat = torch.randint(0, len(STANDARD_RESIDUES_3), (n_token,))
-    restypes_names = [STANDARD_RESIDUES_3[token_idx] for token_idx in restypes_flat]
-    restypes_one_hot = torch.nn.functional.one_hot(
-        restypes_flat,
-        len(STANDARD_RESIDUES_WITH_GAP_3),
+    """Test wrapper around
+    :func:`openfold3.core.data.synthetic.random_of3_features` that sources
+    ``is_multimer`` from the test ``consts``."""
+    return synthetic.random_of3_features(
+        batch_size=batch_size,
+        n_token=n_token,
+        n_msa=n_msa,
+        n_templ=n_templ,
+        is_eval=is_eval,
+        is_multimer=consts.is_multimer,
     )
-
-    num_atoms_per_token = torch.Tensor(
-        [len(TOKEN_NAME_TO_ATOM_NAMES[name]) for name in restypes_names]
-    )
-
-    is_protein = torch.Tensor(
-        [1.0 if name in STANDARD_PROTEIN_RESIDUES_3 else 0.0 for name in restypes_names]
-    )
-    is_rna = torch.Tensor(
-        [1.0 if name in STANDARD_RNA_RESIDUES else 0.0 for name in restypes_names]
-    )
-    is_dna = torch.Tensor(
-        [1.0 if name in STANDARD_DNA_RESIDUES else 0.0 for name in restypes_names]
-    )
-
-    n_atom = torch.max(torch.sum(num_atoms_per_token, dim=-1)).int().item()
-
-    start_atom_index = torch.concat(
-        (torch.zeros((1,)), torch.cumsum(num_atoms_per_token, dim=-1)[:-1]), dim=-1
-    )
-
-    token_mask = torch.ones(n_token).float()
-    atom_mask = torch.ones(n_atom).float()
-
-    rand_token_mask = torch.randint(0, 2, (n_token,)).float()
-    atom_resolved_mask = broadcast_token_feat_to_atoms(
-        token_mask=token_mask,
-        num_atoms_per_token=num_atoms_per_token,
-        token_feat=rand_token_mask,
-    )
-
-    atom_to_token_index = create_atom_to_token_index(
-        token_mask=token_mask,
-        num_atoms_per_token=num_atoms_per_token,
-    ).int()
-
-    asym_id = (
-        torch.Tensor(random_asym_ids(n_token)).unsqueeze(0).repeat((batch_size, 1))
-    )
-
-    features = {
-        # Input features
-        "residue_index": torch.arange(0, n_token)
-        .unsqueeze(0)
-        .repeat((batch_size, 1))
-        .int(),
-        "token_index": torch.arange(0, n_token)
-        .unsqueeze(0)
-        .repeat((batch_size, 1))
-        .int(),
-        "asym_id": asym_id.int(),
-        "entity_id": asym_id.clone().int(),
-        "sym_id": torch.ones((batch_size, n_token)).int(),
-        "restype": restypes_one_hot.unsqueeze(0).repeat((batch_size, 1, 1)).int(),
-        "is_protein": is_protein.unsqueeze(0).repeat((batch_size, 1)).int(),
-        "is_dna": is_dna.unsqueeze(0).repeat((batch_size, 1)).int(),
-        "is_rna": is_rna.unsqueeze(0).repeat((batch_size, 1)).int(),
-        "is_ligand": torch.zeros((batch_size, n_token)).int(),
-        "is_atomized": torch.zeros((batch_size, n_token)).int(),
-        # Reference conformation features
-        "ref_pos": torch.randn((batch_size, n_atom, 3)).float(),
-        "ref_mask": torch.ones((batch_size, n_atom)).int(),
-        "ref_element": torch.ones((batch_size, n_atom, 119)).int(),
-        "ref_charge": torch.ones((batch_size, n_atom)).float(),
-        "ref_atom_name_chars": torch.ones((batch_size, n_atom, 4, 64)).int(),
-        "ref_space_uid": atom_to_token_index.unsqueeze(0).repeat((batch_size, 1)),
-        # MSA features
-        "msa": torch.ones((batch_size, n_msa, n_token, 32)).int(),
-        "has_deletion": torch.ones((batch_size, n_msa, n_token)).float(),
-        "deletion_value": torch.ones((batch_size, n_msa, n_token)).float(),
-        "profile": torch.ones((batch_size, n_token, 32)).float(),
-        "deletion_mean": torch.ones((batch_size, n_token)).float(),
-        # Template features
-        "template_restype": torch.ones((batch_size, n_templ, n_token, 32)).int(),
-        "template_pseudo_beta_mask": torch.ones((batch_size, n_templ, n_token)).float(),
-        "template_backbone_frame_mask": torch.ones(
-            (batch_size, n_templ, n_token)
-        ).float(),
-        "template_distogram": torch.ones(
-            (batch_size, n_templ, n_token, n_token, 39)
-        ).float(),
-        "template_unit_vector": torch.ones(
-            (batch_size, n_templ, n_token, n_token, 3)
-        ).float(),
-        # Bond features
-        "token_bonds": torch.ones((batch_size, n_token, n_token)).int(),
-        # Additional features
-        "token_mask": token_mask.unsqueeze(0).repeat((batch_size, 1)),
-        "atom_mask": atom_mask.unsqueeze(0).repeat((batch_size, 1)),
-        "start_atom_index": start_atom_index.unsqueeze(0).repeat((batch_size, 1)).int(),
-        "num_atoms_per_token": num_atoms_per_token.unsqueeze(0)
-        .repeat((batch_size, 1))
-        .int(),
-        "atom_to_token_index": atom_to_token_index.unsqueeze(0).repeat((batch_size, 1)),
-        "msa_mask": torch.ones((batch_size, n_msa, n_token)).float(),
-        "num_paired_seqs": torch.randint(
-            low=n_msa // 4, high=n_msa // 2, size=(batch_size,)
-        ),
-        "ground_truth": {
-            "atom_positions": torch.randn((batch_size, n_atom, 3)).float(),
-            "atom_resolved_mask": atom_resolved_mask.unsqueeze(0).repeat(
-                (batch_size, 1)
-            ),
-        },
-        "loss_weights": {
-            "bond": torch.Tensor([4.0]).repeat(batch_size),
-            "smooth_lddt": torch.Tensor([4.0]).repeat(batch_size),
-            "mse": torch.Tensor([4.0]).repeat(batch_size),
-            "plddt": torch.Tensor([1e-4]).repeat(batch_size),
-            "pde": torch.Tensor([1e-4]).repeat(batch_size),
-            "experimentally_resolved": torch.Tensor([1e-4]).repeat(batch_size),
-            "pae": torch.Tensor([1e-4]).repeat(batch_size),
-            "distogram": torch.Tensor([3e-2]).repeat(batch_size),
-        },
-    }
-
-    if is_eval:
-        features["ground_truth"]["intra_filter_atomized"] = torch.ones(
-            batch_size, n_atom
-        ).int()
-        features["ground_truth"]["inter_filter_atomized"] = torch.ones(
-            batch_size, n_atom, n_atom
-        ).int()
-
-    return features
 
 
 def create_atomarray_with_bondlist(
