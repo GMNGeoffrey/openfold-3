@@ -577,7 +577,9 @@ if _TRITON_AVAILABLE:
                     float("-inf"),
                 )
 
-            P_block = tl.math.exp(QK_block - M_block)
+            # Clamp QK - M <= 0 to stop bf16 recompute overshoot from inflating
+            # P for large inputs (see _attn_bwd_dk_dv).
+            P_block = tl.math.exp(tl.minimum(QK_block - M_block, 0.0))
 
             dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
             dS_block = P_block * (dP_block - Di[:, None])
@@ -758,7 +760,15 @@ if _TRITON_AVAILABLE:
         qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None]
         dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :]
 
-        K_block = K_block * tl.full((1,), softmax_scale, dtype=K_block.dtype)
+        # NOTE: scale Q (qT), not K, to recompute the score the same way the
+        # forward did. The forward applies softmax_scale to Q before the bf16
+        # dot, so M was built from `round_bf16(scale*Q)`. Scaling K here instead
+        # rounds a different operand andfor sharp attention the recomputed QK
+        # can exceed M by several units, exp() overshoots 1, and dV = P^T dO
+        # blows up. Scaling Q keeps the recompute consistent with M at a small
+        # runtime cost. An alternative would be to scale Q outside the kernels
+        # or inside the dq kernel, which are faster at the cost of increased
+        # memory usage and complexity.
 
         curr_q = 0
         num_steps = (SEQ_LEN + BLOCK_SIZE_Q - 1) // BLOCK_SIZE_Q
@@ -803,9 +813,11 @@ if _TRITON_AVAILABLE:
                         other=0.0,
                     )
 
-            # Compute P^T = K Q^T (transposed attention scores)
+            # Compute P^T = K Q^T (transposed attention scores). Scale qT (not K,
+            # see NOTE above) so QK matches the forward's M.
+            qT_scaled = qT_block * tl.full((1,), softmax_scale, dtype=qT_block.dtype)
             QK_T_block = (
-                tl.dot(K_block, qT_block) + pair_bias_T_block + res_mask_T_block
+                tl.dot(K_block, qT_scaled) + pair_bias_T_block + res_mask_T_block
             )
 
             if not (EVEN_Q & EVEN_KV):
@@ -815,7 +827,14 @@ if _TRITON_AVAILABLE:
                     float("-inf"),
                 )
 
-            P_T_block = tl.math.exp(QK_T_block - m[None, :])
+            # Clamp the softmax exponent to <= 0. In the forward, M =
+            # logsumexp(QK) >= max(QK), so QK - M <= 0 and P = exp(QK - M) in
+            # [0, 1]. The backward kernel recomputes QK independently in bf16;
+            # for sharp attention the recomputed dominant logit is large in
+            # magnitude, so bf16 rounding can make it exceed the forward's
+            # stored M resulting in values greater than 0, which when
+            # exponentiated, explode. The clamp mitigates this issue.
+            P_T_block = tl.math.exp(tl.minimum(QK_T_block - m[None, :], 0.0))
 
             dV_block += tl.dot(P_T_block.to(K_block.dtype), dO_block)
 
@@ -975,8 +994,13 @@ if _TRITON_AVAILABLE:
                 other=float("-inf"),
             )
 
-            QK = tl.dot(Qb, tl.trans(Kb)) * softmax_scale + pb + rmask[None, :]
-            P = tl.math.exp(QK - Mb[:, None])
+            # Scale Qb (not after the dot) so QK matches the forward's M (see
+            # NOTE in _attn_bwd_dk_dv).
+            Qs = Qb * tl.full((1,), softmax_scale, dtype=Qb.dtype)
+            QK = tl.dot(Qs, tl.trans(Kb)) + pb + rmask[None, :]
+            # Clamp QK - M <= 0 to stop bf16 recompute overshoot from inflating
+            # P for sharp attention (see _attn_bwd_dk_dv).
+            P = tl.math.exp(tl.minimum(QK - Mb[:, None], 0.0))
             dP = tl.dot(dOb, tl.trans(Vb)).to(tl.float32)
             acc += P * (dP - Db[:, None])
 
