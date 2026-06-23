@@ -268,6 +268,7 @@ class TestTrainingExperiment:
         expt_config = TrainingExperimentConfig(
             dataset_paths={},
             dataset_configs={},
+            synthetic_data={"enabled": True},
             **config_utils.load_yaml(test_yaml_file),
         )
         assert expt_config.experiment_settings.seed == model_seed
@@ -474,7 +475,7 @@ class TestWandbHandler(unittest.TestCase):
 
         # Create dummy configuration objects with a to_dict() method.
         dummy_runner_args = TrainingExperimentConfig(
-            dataset_configs={}, dataset_paths={}
+            dataset_configs={}, dataset_paths={}, synthetic_data={"enabled": True}
         )
         dummy_data_module_config = DataModuleConfig(datasets=[])
         dummy_model_config = mlc.ConfigDict({"model": "dummy"})

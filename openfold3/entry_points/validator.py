@@ -28,6 +28,7 @@ from packaging.version import Version
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic import ConfigDict as PydanticConfigDict
 
+from openfold3.core.data.framework.synthetic_data import SyntheticDataConfig
 from openfold3.core.data.pipelines.preprocessing.template import (
     TemplatePreprocessorSettings,
 )
@@ -342,6 +343,7 @@ class ExperimentConfig(BaseModel):
     user_default_runner_yaml_path: Path | None = None
     memory_snapshot: MemorySnapshotConfig = MemorySnapshotConfig()
     profiler: ProfilerConfig = ProfilerConfig()
+    synthetic_data: SyntheticDataConfig = SyntheticDataConfig()
 
 
 class TrainingExperimentConfig(ExperimentConfig):
@@ -349,15 +351,28 @@ class TrainingExperimentConfig(ExperimentConfig):
 
     # pydantic model setting to prevent extra fields in main experiment config
     model_config = PydanticConfigDict(extra="forbid")
-    # required arguments for training experiment
-    dataset_paths: dict[str, TrainingDatasetPaths]
-    dataset_configs: dict[str, Any]
+    # Real-dataset arguments. Default to empty dicts (rather than Optional) so
+    # that when omitted for a synthetic_data run, pydantic never instantiates the
+    # existence-validated TrainingDatasetPaths and the dict type hint is
+    # preserved at all call sites. See validate_data_source below.
+    dataset_paths: dict[str, TrainingDatasetPaths] = Field(default_factory=dict)
+    dataset_configs: dict[str, Any] = Field(default_factory=dict)
 
     experiment_settings: TrainingExperimentSettings = TrainingExperimentSettings()
     logging_config: LoggingConfig = LoggingConfig()
     checkpoint_config: CheckpointConfig = CheckpointConfig()
     model_update: ModelUpdate = ModelUpdate(presets=["train"])
     data_module_args: DataModuleArgs = DataModuleArgs()
+
+    @model_validator(mode="after")
+    def validate_data_source(self):
+        """Require either a real dataset or synthetic_data, not neither."""
+        if not self.synthetic_data.enabled and not self.dataset_paths:
+            raise ValueError(
+                "Training requires dataset_paths/dataset_configs, unless "
+                "synthetic_data.enabled is set for a synthetic-data run."
+            )
+        return self
 
     @model_validator(mode="after")
     def synchronize_seeds(self):
@@ -449,6 +464,15 @@ class InferenceExperimentConfig(ExperimentConfig):
     @model_validator(mode="after")
     def validate_ckpt_settings(self):
         """Validates inference_ckpt_path and inference_ckpt name settings."""
+        # Synthetic-data runs with no checkpoint provided use random init (no
+        # download): leave both ckpt fields None and skip selection.
+        if (
+            self.synthetic_data.enabled
+            and self.inference_ckpt_path is None
+            and self.inference_ckpt_name is None
+        ):
+            return self
+
         # Prioritize using checkpoint path when set
         if isinstance(self.inference_ckpt_path, Path):
             if self.inference_ckpt_path.exists():
@@ -504,6 +528,10 @@ class InferenceExperimentConfig(ExperimentConfig):
         """
         # Skip ckpt selection if ckpt is previously specified
         if self.inference_ckpt_path is not None:
+            return self
+
+        # Synthetic-data runs with no checkpoint name selected use random init.
+        if self.synthetic_data.enabled and self.inference_ckpt_name is None:
             return self
 
         param_dir = get_default_checkpoint_dir(cache_path=self.cache_path)

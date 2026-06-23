@@ -87,11 +87,18 @@ def train(
         runner_dict["experiment_settings"]["seed"] = seed
 
     if data_seed is not None:
-        runner_dict["data_module_args"]["data_seed"] = data_seed
+        runner_dict.setdefault("data_module_args", {})["data_seed"] = data_seed
 
     expt_config = TrainingExperimentConfig.model_validate(runner_dict)
 
-    expt_runner = TrainingExperimentRunner(expt_config)
+    if expt_config.synthetic_data.enabled:
+        from openfold3.entry_points.synthetic_experiment import (
+            SyntheticTrainingExperimentRunner,
+        )
+
+        expt_runner = SyntheticTrainingExperimentRunner(expt_config)
+    else:
+        expt_runner = TrainingExperimentRunner(expt_config)
     expt_runner.setup()
     expt_runner.run()
 
@@ -101,8 +108,9 @@ def train(
     "--query-json",
     "--query_json",
     type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
-    required=True,
-    help="Json containing the queries for prediction.",
+    required=False,
+    help="Json containing the queries for prediction. Not required when the"
+    " runner yaml enables synthetic_data (synthetic input).",
 )
 @click.option(
     "--inference-ckpt-path",
@@ -178,7 +186,7 @@ def train(
     help="Use tf32 precision",
 )
 def predict(
-    query_json: Path,
+    query_json: Path | None = None,
     inference_ckpt_path: Path | None = None,
     inference_ckpt_name: str | None = None,
     num_diffusion_samples: int | None = None,
@@ -226,6 +234,35 @@ def predict(
         user_default_runner_yaml_path=user_default_runner_path,
         **runner_args,
     )
+
+    if expt_config.synthetic_data.enabled:
+        from openfold3.entry_points.synthetic_experiment import (
+            SyntheticInferenceExperimentRunner,
+        )
+
+        expt_runner = SyntheticInferenceExperimentRunner(
+            expt_config,
+            num_diffusion_samples,
+            num_model_seeds,
+            use_msa_server,
+            use_templates,
+            output_dir,
+        )
+        # No query set for synthetic input.
+        try:
+            expt_runner.setup()
+            expt_runner.run()
+        except BaseException:
+            expt_runner.cleanup_intermediates()
+            raise
+        expt_runner.cleanup()
+        return
+
+    if query_json is None:
+        raise click.UsageError(
+            "--query-json is required unless the runner yaml enables synthetic_data."
+        )
+
     expt_runner = InferenceExperimentRunner(
         expt_config,
         num_diffusion_samples,
