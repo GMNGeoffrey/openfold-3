@@ -499,6 +499,12 @@ def compute_disorder(
         dtype=atom_positions_predicted.dtype,
     )
 
+    # Disorder is a structural (SASA) metric; without a parsed structure
+    # (e.g. synthetic / dummy inputs) there is nothing to compute it over, so
+    # report zero disorder rather than dereferencing a missing atom_array.
+    if atom_array is None:
+        return disorder
+
     # Set all atoms to unresolved
     # `process_disorder` computes RASA only over unresolved atoms
     atom_array.set_annotation("atom_resolved_mask", np.zeros(num_atoms, dtype=bool))

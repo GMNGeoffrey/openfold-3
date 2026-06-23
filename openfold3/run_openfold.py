@@ -68,11 +68,18 @@ def train(runner_yaml: Path, seed: int | None = None, data_seed: int | None = No
         runner_dict["experiment_settings"]["seed"] = seed
 
     if data_seed is not None:
-        runner_dict["data_module_args"]["data_seed"] = data_seed
+        runner_dict.setdefault("data_module_args", {})["data_seed"] = data_seed
 
     expt_config = TrainingExperimentConfig.model_validate(runner_dict)
 
-    expt_runner = TrainingExperimentRunner(expt_config)
+    if expt_config.dummy_data.enabled:
+        from openfold3.entry_points.dummy_experiment import (
+            DummyTrainingExperimentRunner,
+        )
+
+        expt_runner = DummyTrainingExperimentRunner(expt_config)
+    else:
+        expt_runner = TrainingExperimentRunner(expt_config)
     expt_runner.setup()
     expt_runner.run()
 
@@ -82,8 +89,9 @@ def train(runner_yaml: Path, seed: int | None = None, data_seed: int | None = No
     "--query-json",
     "--query_json",
     type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
-    required=True,
-    help="Json containing the queries for prediction.",
+    required=False,
+    help="Json containing the queries for prediction. Not required when the"
+    " runner yaml enables dummy_data (synthetic input).",
 )
 @click.option(
     "--inference-ckpt-path",
@@ -153,7 +161,7 @@ def train(runner_yaml: Path, seed: int | None = None, data_seed: int | None = No
     help="Output directory for writing results",
 )
 def predict(
-    query_json: Path,
+    query_json: Path | None = None,
     inference_ckpt_path: Path | None = None,
     inference_ckpt_name: str | None = None,
     num_diffusion_samples: int | None = None,
@@ -184,6 +192,31 @@ def predict(
         inference_ckpt_name=inference_ckpt_name,
         **runner_args,
     )
+
+    if expt_config.dummy_data.enabled:
+        from openfold3.entry_points.dummy_experiment import (
+            DummyInferenceExperimentRunner,
+        )
+
+        expt_runner = DummyInferenceExperimentRunner(
+            expt_config,
+            num_diffusion_samples,
+            num_model_seeds,
+            use_msa_server,
+            use_templates,
+            output_dir,
+        )
+        # No query set for dummy (synthetic) input.
+        expt_runner.setup()
+        expt_runner.run()
+        expt_runner.cleanup()
+        return
+
+    if query_json is None:
+        raise click.UsageError(
+            "--query-json is required unless the runner yaml enables dummy_data."
+        )
+
     expt_runner = InferenceExperimentRunner(
         expt_config,
         num_diffusion_samples,
@@ -231,12 +264,12 @@ def align_msa_server(
     msa_computation_settings_yaml: Path | None = None,
 ):
     """Run MSA server alignment only with ColabFold MSA server.
-    
+
     Example command:
     python run_openfold.py align-msa-server \
         --query_json query_example.json \
         --output_dir output/msa_server_test \
-    
+
     More settings can be specified using the `msa_computation_settings_yaml` flag
     An example yaml file is provided in `examples/msa_server.yml`
     """

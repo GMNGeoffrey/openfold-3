@@ -1,0 +1,53 @@
+# Synthetic-data training profiling / benchmarking run.
+#
+# Runs the production training path (real OpenFold3AllAtom LightningModule +
+# pl.Trainer.fit, EMA, manual optimization, LR schedule) on randomly-valued
+# features, with NO on-disk dataset, alignments, templates, or checkpoint.
+#
+#   python -m openfold3.run_openfold train \
+#       --runner-yaml examples/example_runner_yamls/dummy_train.yml
+#
+# Per-step training time is written to <output_dir>/train_timing_rank*.jsonl
+# (production PredictTimer, also logged to the logger if one is configured).
+# MemorySnapshot dumps a snapshot pickle viewable at https://pytorch.org/memory_viz
+# and records peak GPU memory to <output_dir>/memsnap_peak_mem_rank*.json. Enable
+# `profiler` for per-kernel chrome traces (off by default; the ROCm profiler path
+# can stall on the full model).
+
+experiment_settings:
+  mode: train
+  output_dir: ./dummy_train_output
+
+pl_trainer_args:
+  devices: 1
+  precision: bf16-mixed
+
+model_update:
+  presets:
+    - train
+  custom:
+    settings:
+      memory:
+        train:
+          # Triton triangle-attention kernels (the AMD/MI300X optimization
+          # target). Set false to profile stock PyTorch attention.
+          use_triton_triangle_kernels: true
+
+dummy_data:
+  enabled: true
+  n_token: 384        # crop / token count (training stages: 384 / 640 / 768)
+  n_msa: 1024         # MSA depth (subsampled internally per recycle)
+  n_templ: 4
+  batch_size: 1
+  n_steps: 5          # total steps (this many synthetic batches; avg post-warmup)
+  full_permutation: true   # real multi-chain permutation alignment in the loss
+
+profiler:
+  enabled: false
+  dirpath: logs/profiler_traces
+  filename: dummy_train_trace
+
+memory_snapshot:
+  enabled: true
+  step: 3             # snapshot a steady-state step (post warmup)
+  dump_on_oom: true

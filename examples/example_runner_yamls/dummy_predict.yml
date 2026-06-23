@@ -1,0 +1,47 @@
+# Synthetic-data inference profiling / OOM-validation run.
+#
+# Runs the production predict path (InferenceExperimentRunner -> trainer.predict,
+# real forward + confidence scoring) on randomly-valued features, with NO query
+# json, alignments, templates, or checkpoint (random-initialized weights). Use
+# for peak-memory / OOM validation and per-step timing at a given token count.
+#
+#   python -m openfold3.run_openfold predict \
+#       --runner-yaml examples/example_runner_yamls/dummy_predict.yml
+#
+# To profile with real weights instead of random init, pass
+# --inference-ckpt-path / --inference-ckpt-name on the CLI.
+
+experiment_settings:
+  mode: predict
+  output_dir: ./dummy_predict_output
+
+pl_trainer_args:
+  devices: 1
+  precision: bf16-mixed
+
+model_update:
+  presets:
+    - predict
+  custom:
+    settings:
+      memory:
+        eval:
+          use_triton_triangle_kernels: true
+
+dummy_data:
+  enabled: true
+  n_token: 384
+  n_msa: 1024
+  n_templ: 4
+  batch_size: 1
+  n_steps: 3
+
+profiler:
+  enabled: false
+  dirpath: logs/profiler_traces
+  filename: dummy_predict_trace
+
+memory_snapshot:
+  enabled: true
+  step: 1
+  dump_on_oom: true
