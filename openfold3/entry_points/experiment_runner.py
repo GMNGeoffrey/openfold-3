@@ -562,7 +562,9 @@ class TrainingExperimentRunner(ExperimentRunner):
             _callbacks.append(ModelCheckpoint(**_checkpoint.model_dump()))
 
         if self.model_config.settings.debug.log_iteration_time:
-            _callbacks.append(PredictTimer(output_dir=None))
+            # Pass output_dir so per-step training timing is also written to a
+            # file (train_timing_rank*.jsonl), not only logged to the logger.
+            _callbacks.append(PredictTimer(output_dir=self.output_dir))
 
         # Registered after PredictTimer so the snapshot dump stays outside the
         # timer's measurement window.

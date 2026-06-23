@@ -47,15 +47,23 @@ class MemorySnapshot(pl.Callback):
     Records memory history and dumps a snapshot pickle.
     The pickle can be visualized at https://pytorch.org/memory_viz
 
+    Also records peak GPU memory (``torch.cuda.max_memory_allocated``) over the
+    snapshot ``step``: peak stats are reset at the step's batch-start and read at
+    batch-end, then logged to ``pl_module.logger`` (if any) and written to a
+    sidecar JSON next to the pickle (so the value is available without a logger).
+
     Args:
         output_path: Path to save the .pickle snapshot file.
         step: Step (batch_idx) at which to record and dump a single-step
-            snapshot. Set to `None` to disable step-based snapshotting (useful
-            when only dump_on_oom is needed). Defaults to 0.
+            snapshot (and measure peak memory). Set to `None` to disable
+            step-based snapshotting (useful when only dump_on_oom is needed).
+            Defaults to 0.
         dump_on_oom: If True, attaches an OOM observer that dumps the snapshot
             on out-of-memory. History is reset each step to keep the snapshot
             small.
         stacks: Stack trace mode for record_memory_history. Defaults to "all".
+        record_peak_memory: If True (default), measure + emit peak GPU memory
+            over the snapshot step.
     """
 
     def __init__(
@@ -64,12 +72,15 @@ class MemorySnapshot(pl.Callback):
         step: int | None = 0,
         dump_on_oom: bool = False,
         stacks: str = "all",
+        record_peak_memory: bool = True,
     ):
         super().__init__()
         self.output_path = output_path
         self.step = step
         self.dump_on_oom = dump_on_oom
         self.stacks = stacks
+        self.record_peak_memory = record_peak_memory
+        self.peak_mem_gib: float | None = None
         self._oom_dumped = False
         self._setup_done = False
         self._global_rank = 0
@@ -78,6 +89,11 @@ class MemorySnapshot(pl.Callback):
         """Build output path with rank and suffix before the extension."""
         p = Path(self.output_path)
         return str(p.with_stem(f"{p.stem}{suffix}_rank{self._global_rank}"))
+
+    def _peak_mem_path(self) -> Path:
+        """Sidecar JSON path (next to the pickle) for the peak-memory value."""
+        p = Path(self.output_path)
+        return p.with_name(f"{p.stem}_peak_mem_rank{self._global_rank}.json")
 
     def _oom_observer(self, device, alloc, device_allocated, device_free):
         if self._oom_dumped:
@@ -116,11 +132,17 @@ class MemorySnapshot(pl.Callback):
             # Reset history so the snapshot only contains the current step
             torch.cuda.memory._record_memory_history(enabled=None)
             torch.cuda.memory._record_memory_history(stacks=self.stacks)
+        if record_step and self.record_peak_memory and torch.cuda.is_available():
+            # Measure peak memory over this (steady-state) step.
+            torch.cuda.reset_peak_memory_stats()
 
-    def _on_batch_end(self, batch_idx: int):
+    def _on_batch_end(self, pl_module, batch_idx: int):
         record_step = self.step_recording_enabled and batch_idx == self.step
         if not record_step:
             return
+
+        if self.record_peak_memory and torch.cuda.is_available():
+            self._emit_peak_memory(pl_module)
 
         output_path = self._tagged_path("")
         logger.info(f"MemorySnapshot: Dumping snapshot to {output_path}")
@@ -129,13 +151,40 @@ class MemorySnapshot(pl.Callback):
         if not self.dump_on_oom:
             torch.cuda.memory._record_memory_history(enabled=None)
 
+    def _emit_peak_memory(self, pl_module):
+        """Record peak GPU memory for the snapshot step: store it, log to the
+        logger if present, and write a sidecar JSON (logger-independent)."""
+        self.peak_mem_gib = torch.cuda.max_memory_allocated() / 1024**3
+        logger.info(
+            f"MemorySnapshot: peak GPU memory at step {self.step} on rank "
+            f"{self._global_rank}: {self.peak_mem_gib:.2f} GiB"
+        )
+        if getattr(pl_module, "logger", None) is not None:
+            # Rank-tag the metric key so concurrent DDP ranks don't overwrite
+            # each other (the sidecar JSON path is already rank-tagged).
+            pl_module.logger.log_metrics(
+                {f"peak_mem_gib_rank{self._global_rank}": self.peak_mem_gib},
+                step=pl_module.global_step,
+            )
+        try:
+            path = self._peak_mem_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {"peak_mem_gib": round(self.peak_mem_gib, 3), "step": self.step},
+                    indent=2,
+                )
+            )
+        except OSError as e:
+            logger.warning(f"MemorySnapshot: could not write peak-mem JSON: {e}")
+
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx, **kwargs):
         self._on_batch_start(batch_idx=batch_idx)
 
     def on_train_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, **kwargs
     ):
-        self._on_batch_end(batch_idx=batch_idx)
+        self._on_batch_end(pl_module, batch_idx=batch_idx)
 
     def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, **kwargs):
         self._on_batch_start(batch_idx=batch_idx)
@@ -143,7 +192,7 @@ class MemorySnapshot(pl.Callback):
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, **kwargs
     ):
-        self._on_batch_end(batch_idx=batch_idx)
+        self._on_batch_end(pl_module, batch_idx=batch_idx)
 
     def on_predict_batch_start(self, trainer, pl_module, batch, batch_idx, **kwargs):
         self._on_batch_start(batch_idx=batch_idx)
@@ -151,7 +200,7 @@ class MemorySnapshot(pl.Callback):
     def on_predict_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, **kwargs
     ):
-        self._on_batch_end(batch_idx=batch_idx)
+        self._on_batch_end(pl_module, batch_idx=batch_idx)
 
     def on_test_batch_start(self, trainer, pl_module, batch, batch_idx, **kwargs):
         self._on_batch_start(batch_idx=batch_idx)
@@ -159,7 +208,7 @@ class MemorySnapshot(pl.Callback):
     def on_test_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, **kwargs
     ):
-        self._on_batch_end(batch_idx=batch_idx)
+        self._on_batch_end(pl_module, batch_idx=batch_idx)
 
 
 class PredictTimer(pl.Callback):
@@ -207,6 +256,24 @@ class PredictTimer(pl.Callback):
                 {"seconds_per_iteration": runtime}, step=pl_module.global_step
             )
 
+        # Also record per-step training timing to a file when an output_dir is
+        # set, so step timing is available without a (wandb) logger. Appended as
+        # JSON lines, rank-tagged for distributed runs.
+        if self.output_dir is not None:
+            rank = getattr(trainer, "global_rank", 0)
+            timing_file = Path(self.output_dir) / f"train_timing_rank{rank}.jsonl"
+            timing_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(timing_file, "a") as fp:
+                fp.write(
+                    json.dumps(
+                        {
+                            "global_step": int(pl_module.global_step),
+                            "runtime_s": runtime,
+                        }
+                    )
+                    + "\n"
+                )
+
     def on_predict_batch_start(
         self, trainer, pl_module, batch, batch_idx, dataloader_idx: int = 0
     ):
@@ -241,7 +308,10 @@ class PredictTimer(pl.Callback):
 
             output_subdir = Path(self.output_dir) / query_id / f"seed_{seed}"
 
-            # Save runtime for the batch
+            # Save runtime for the batch. Create the subdir if needed: in the
+            # normal predict path OF3OutputWriter creates it, but timing should
+            # not depend on the writer being present (e.g. dummy-data runs).
+            output_subdir.mkdir(parents=True, exist_ok=True)
             runtime_file = output_subdir / "timing.json"
             runtime_json = {"runtime_s": runtime_per_sample}
             runtime_file.write_text(json.dumps(runtime_json, indent=4))
