@@ -392,12 +392,15 @@ if _TRITON_AVAILABLE:
         gx = 2.0 * g * (pi_x - pj_x)
         gy = 2.0 * g * (pi_y - pj_y)
         gz = 2.0 * g * (pi_z - pj_z)
-        tl.atomic_add(grad_pred_ptr + gbase_i + 0, gx, mask=active)
-        tl.atomic_add(grad_pred_ptr + gbase_i + 1, gy, mask=active)
-        tl.atomic_add(grad_pred_ptr + gbase_i + 2, gz, mask=active)
-        tl.atomic_add(grad_pred_ptr + gbase_j + 0, -gx, mask=active)
-        tl.atomic_add(grad_pred_ptr + gbase_j + 1, -gy, mask=active)
-        tl.atomic_add(grad_pred_ptr + gbase_j + 2, -gz, mask=active)
+        # grad_pred is only read after the kernel, so no ordering is needed. The
+        # default acq_rel adds an L2 writeback + invalidate per atomic on AMD
+        # multi-XCD GPUs (MI300/MI355).
+        tl.atomic_add(grad_pred_ptr + gbase_i + 0, gx, mask=active, sem="relaxed")
+        tl.atomic_add(grad_pred_ptr + gbase_i + 1, gy, mask=active, sem="relaxed")
+        tl.atomic_add(grad_pred_ptr + gbase_i + 2, gz, mask=active, sem="relaxed")
+        tl.atomic_add(grad_pred_ptr + gbase_j + 0, -gx, mask=active, sem="relaxed")
+        tl.atomic_add(grad_pred_ptr + gbase_j + 1, -gy, mask=active, sem="relaxed")
+        tl.atomic_add(grad_pred_ptr + gbase_j + 2, -gz, mask=active, sem="relaxed")
 
 
 def _query_with_pred_compact(
