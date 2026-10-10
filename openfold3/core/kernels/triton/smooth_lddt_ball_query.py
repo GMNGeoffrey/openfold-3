@@ -336,7 +336,7 @@ if _TRITON_AVAILABLE:
 
         tl.store(neighbor_count_ptr + n * P1 + i, seen)
 
-    @triton.jit(do_not_specialize=["N", "P1", "P2", "K", "total"])
+    @triton.jit(do_not_specialize=["N", "P1", "P2", "K"])
     def _ball_query_backward_kernel(
         predx_ptr,
         predy_ptr,
@@ -349,24 +349,20 @@ if _TRITON_AVAILABLE:
         P1,
         P2,
         K,
-        total,
         PRED_IS_BF16: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        pid = tl.program_id(0).to(tl.int64)
-        start = pid * BLOCK
-        offs = start + tl.arange(0, BLOCK)
-        mask = offs < total
-
-        pk = P1 * K
-        n = offs // pk
-        rem = offs % pk
-        i = rem // K
+        """One program per (query row, chunk of its K neighbor slots)."""
+        row = tl.program_id(0).to(tl.int64)
+        offs_k = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs_k < K
+        offs = row * K + offs_k
+        n = row // P1
 
         j = tl.load(idx_ptr + offs, mask=mask, other=-1)
-        qi = tl.load(query_idx_ptr + n * P1 + i, mask=mask, other=-1)
+        qi = tl.load(query_idx_ptr + row)
         g = tl.load(grad_dists_ptr + offs, mask=mask, other=0.0)
-        active = mask & (j >= 0) & (qi >= 0) & (g != 0.0)
+        active = mask & (j >= 0) & (g != 0.0)
 
         base_i = n * P2 + qi
         base_j = n * P2 + j
@@ -375,29 +371,30 @@ if _TRITON_AVAILABLE:
         gbase_j = base_j * 3
 
         if PRED_IS_BF16:
-            pi_x = tl.load(predx_ptr + base_i, mask=active, other=0.0).to(tl.float32)
-            pi_y = tl.load(predy_ptr + base_i, mask=active, other=0.0).to(tl.float32)
-            pi_z = tl.load(predz_ptr + base_i, mask=active, other=0.0).to(tl.float32)
+            pi_x = tl.load(predx_ptr + base_i).to(tl.float32)
+            pi_y = tl.load(predy_ptr + base_i).to(tl.float32)
+            pi_z = tl.load(predz_ptr + base_i).to(tl.float32)
             pj_x = tl.load(predx_ptr + base_j, mask=active, other=0.0).to(tl.float32)
             pj_y = tl.load(predy_ptr + base_j, mask=active, other=0.0).to(tl.float32)
             pj_z = tl.load(predz_ptr + base_j, mask=active, other=0.0).to(tl.float32)
         else:
-            pi_x = tl.load(predx_ptr + base_i, mask=active, other=0.0)
-            pi_y = tl.load(predy_ptr + base_i, mask=active, other=0.0)
-            pi_z = tl.load(predz_ptr + base_i, mask=active, other=0.0)
+            pi_x = tl.load(predx_ptr + base_i)
+            pi_y = tl.load(predy_ptr + base_i)
+            pi_z = tl.load(predz_ptr + base_i)
             pj_x = tl.load(predx_ptr + base_j, mask=active, other=0.0)
             pj_y = tl.load(predy_ptr + base_j, mask=active, other=0.0)
             pj_z = tl.load(predz_ptr + base_j, mask=active, other=0.0)
 
-        gx = 2.0 * g * (pi_x - pj_x)
-        gy = 2.0 * g * (pi_y - pj_y)
-        gz = 2.0 * g * (pi_z - pj_z)
+        gx = tl.where(active, 2.0 * g * (pi_x - pj_x), 0.0)
+        gy = tl.where(active, 2.0 * g * (pi_y - pj_y), 0.0)
+        gz = tl.where(active, 2.0 * g * (pi_z - pj_z), 0.0)
         # grad_pred is only read after the kernel, so no ordering is needed. The
         # default acq_rel adds an L2 writeback + invalidate per atomic on AMD
         # multi-XCD GPUs (MI300/MI355).
-        tl.atomic_add(grad_pred_ptr + gbase_i + 0, gx, mask=active, sem="relaxed")
-        tl.atomic_add(grad_pred_ptr + gbase_i + 1, gy, mask=active, sem="relaxed")
-        tl.atomic_add(grad_pred_ptr + gbase_i + 2, gz, mask=active, sem="relaxed")
+        # All lanes share query atom i, so reduce its gradient before the atomic.
+        tl.atomic_add(grad_pred_ptr + gbase_i + 0, tl.sum(gx), sem="relaxed")
+        tl.atomic_add(grad_pred_ptr + gbase_i + 1, tl.sum(gy), sem="relaxed")
+        tl.atomic_add(grad_pred_ptr + gbase_i + 2, tl.sum(gz), sem="relaxed")
         tl.atomic_add(grad_pred_ptr + gbase_j + 0, -gx, mask=active, sem="relaxed")
         tl.atomic_add(grad_pred_ptr + gbase_j + 1, -gy, mask=active, sem="relaxed")
         tl.atomic_add(grad_pred_ptr + gbase_j + 2, -gz, mask=active, sem="relaxed")
@@ -546,13 +543,12 @@ def _pred_backward(
         (n_batch, n_atom, 3), device=pred.device, dtype=torch.float32
     )
 
-    total = n_batch * n_query * k
-    if total == 0:
+    if n_batch * n_query * k == 0:
         return grad_pred
 
     predx, predy, predz = _as_soa(pred)
-    n_programs = (total + _BWD_BLOCK - 1) // _BWD_BLOCK
-    _ball_query_backward_kernel[(n_programs,)](
+    grid = (n_batch * n_query, triton.cdiv(k, _BWD_BLOCK))
+    _ball_query_backward_kernel[grid](
         predx,
         predy,
         predz,
@@ -564,7 +560,6 @@ def _pred_backward(
         n_query,
         n_atom,
         k,
-        total,
         PRED_IS_BF16=pred.dtype == torch.bfloat16,
         BLOCK=_BWD_BLOCK,
         num_warps=_BWD_NUM_WARPS,
